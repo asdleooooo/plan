@@ -1,0 +1,141 @@
+name: codex-implement-loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: "Ticket identifier"
+        required: true
+        type: string
+      plan_pr_number:
+        description: "Plan PR number (optional for manual trigger)"
+        required: false
+        default: ""
+        type: string
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  implement-loop:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.comment.body, '/codex-impl')
+    runs-on: ubuntu-latest
+    env:
+      PLAN_GATE_STRATEGY: label
+      VERIFY_MAX_RETRIES: "2"
+    steps:
+      - name: Validate commenter permission
+        if: github.event_name == 'issue_comment'
+        run: |
+          set -euo pipefail
+          assoc="${{ github.event.comment.author_association }}"
+          case "${assoc}" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *)
+              echo "Unauthorized slash command caller: ${assoc}" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve context
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          ticket=""
+          pr_number=""
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ticket="${{ inputs.ticket_id }}"
+            pr_number="${{ inputs.plan_pr_number }}"
+          else
+            pr_number="${{ github.event.issue.number }}"
+            if [[ "${COMMENT_BODY}" =~ /codex-impl[[:space:]]+([A-Za-z0-9._-]+) ]]; then
+              ticket="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -z "${ticket}" && "${{ github.event.issue.pull_request != null }}" == "true" ]]; then
+              head_ref="$(gh pr view "${pr_number}" --json headRefName --jq '.headRefName')"
+              if [[ "${head_ref}" == feat/* ]]; then
+                ticket="${head_ref#feat/}"
+              elif [[ "${head_ref}" == plan/* ]]; then
+                ticket="${head_ref#plan/}"
+              fi
+            fi
+          fi
+
+          if [[ -z "${ticket}" ]]; then
+            echo "Unable to resolve ticket_id. For comment trigger use: /codex-impl <ticket_id>" >&2
+            exit 1
+          fi
+
+          echo "ticket_id=${ticket}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect labels/reviews and feedback
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.ctx.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+
+          if [[ -n "${PR_NUMBER}" ]]; then
+            labels="$(gh pr view "${PR_NUMBER}" --json labels --jq '.labels | map(.name) | join(",")')"
+            approved="$(gh pr view "${PR_NUMBER}" --json reviews --jq '[.reviews[] | select(.state=="APPROVED")] | length')"
+            {
+              gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --jq '.[].body'
+              gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/comments" --jq '.[].body' || true
+            } > .tmp/review_feedback.txt
+          else
+            labels=""
+            approved="0"
+            : > .tmp/review_feedback.txt
+          fi
+
+          echo "PLAN_LABELS=${labels}" >> "$GITHUB_ENV"
+          echo "APPROVED_REVIEW_COUNT=${approved}" >> "$GITHUB_ENV"
+
+      - name: Check plan gate
+        run: |
+          set -euo pipefail
+          bash scripts/codex/check_plan_gate.sh "${{ steps.ctx.outputs.ticket_id }}" "${PLAN_GATE_STRATEGY}"
+
+      - name: Update plan delta
+        run: |
+          set -euo pipefail
+          bash scripts/codex/update_plan_delta.sh "${{ steps.ctx.outputs.ticket_id }}" ".tmp/review_feedback.txt"
+
+      - name: Execute plan
+        run: |
+          set -euo pipefail
+          bash scripts/codex/execute_plan.sh "${{ steps.ctx.outputs.ticket_id }}" ".tmp/review_feedback.txt"
+
+      - name: Create or update implementation PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: feat/${{ steps.ctx.outputs.ticket_id }}
+          commit-message: "feat(impl): execute plan for ${{ steps.ctx.outputs.ticket_id }}"
+          title: "feat: implement ${{ steps.ctx.outputs.ticket_id }}"
+          body: |
+            Auto-generated implementation update.
+
+            Continue iteration by commenting:
+            - `/codex-impl ${{ steps.ctx.outputs.ticket_id }}`
+          labels: impl-review
+          add-paths: |
+            plans/${{ steps.ctx.outputs.ticket_id }}/execution_report.md
+            plans/${{ steps.ctx.outputs.ticket_id }}/plan_delta.md
+            tests/generated_smoke_test.md

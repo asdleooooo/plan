@@ -1,0 +1,38 @@
+name: plan-gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  plan-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate check
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels) }}
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "Manual run; skipping strict gate."
+            exit 0
+          fi
+
+          if [[ "${HEAD_REF}" != plan/* ]]; then
+            echo "Not a plan branch (${HEAD_REF}); gate passes."
+            exit 0
+          fi
+
+          ticket="${HEAD_REF#plan/}"
+          labels="$(jq -r 'map(.name) | join(",")' <<< "${LABELS_JSON}")"
+          export PLAN_LABELS="${labels}"
+          export PLAN_REQUIRED_LABEL="plan-approved"
+          bash scripts/codex/check_plan_gate.sh "${ticket}" label

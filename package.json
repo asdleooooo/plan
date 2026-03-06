@@ -1,0 +1,12 @@
+﻿{
+  "name": "codex-double-loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Bootstrap for Codex plan/implement closed-loop workflows.",
+  "scripts": {
+    "lint": "node scripts/codex/placeholder-check.mjs lint",
+    "test": "node scripts/codex/placeholder-check.mjs test",
+    "build": "node scripts/codex/placeholder-check.mjs build",
+    "verify": "npm run lint && npm run test && npm run build"
+  }
+}

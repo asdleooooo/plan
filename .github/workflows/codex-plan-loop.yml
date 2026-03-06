@@ -1,0 +1,142 @@
+name: codex-plan-loop
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_id:
+        description: "Ticket identifier"
+        required: true
+        type: string
+      requirements_path:
+        description: "Path to requirement file"
+        required: false
+        default: ""
+        type: string
+      ui_path:
+        description: "Path to UI spec directory/file"
+        required: false
+        default: ""
+        type: string
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  plan-loop:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.comment.body, '/codex-plan')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate commenter permission
+        if: github.event_name == 'issue_comment'
+        run: |
+          set -euo pipefail
+          assoc="${{ github.event.comment.author_association }}"
+          case "${assoc}" in
+            OWNER|MEMBER|COLLABORATOR) ;;
+            *)
+              echo "Unauthorized slash command caller: ${assoc}" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve context
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+
+          ticket=""
+          req_path=""
+          ui_path=""
+          issue_number=""
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ticket="${{ inputs.ticket_id }}"
+            req_path="${{ inputs.requirements_path }}"
+            ui_path="${{ inputs.ui_path }}"
+          else
+            issue_number="${{ github.event.issue.number }}"
+            if [[ "${COMMENT_BODY}" =~ /codex-plan[[:space:]]+([A-Za-z0-9._-]+) ]]; then
+              ticket="${BASH_REMATCH[1]}"
+            fi
+
+            if [[ -z "${ticket}" && "${{ github.event.issue.pull_request != null }}" == "true" ]]; then
+              head_ref="$(gh pr view "${issue_number}" --json headRefName --jq '.headRefName')"
+              if [[ "${head_ref}" == plan/* ]]; then
+                ticket="${head_ref#plan/}"
+              fi
+            fi
+          fi
+
+          if [[ -z "${ticket}" ]]; then
+            echo "Unable to resolve ticket_id. For comment trigger use: /codex-plan <ticket_id>" >&2
+            exit 1
+          fi
+
+          if [[ -z "${req_path}" ]]; then
+            req_path="docs/requirements/${ticket}.md"
+          fi
+          if [[ -z "${ui_path}" ]]; then
+            ui_path="docs/ui/${ticket}"
+          fi
+
+          echo "ticket_id=${ticket}" >> "$GITHUB_OUTPUT"
+          echo "requirements_path=${req_path}" >> "$GITHUB_OUTPUT"
+          echo "ui_path=${ui_path}" >> "$GITHUB_OUTPUT"
+          echo "issue_number=${issue_number}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect feedback text
+        if: steps.ctx.outputs.issue_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          {
+            gh api "repos/${{ github.repository }}/issues/${ISSUE_NUMBER}/comments" --jq '.[].body'
+            gh api "repos/${{ github.repository }}/pulls/${ISSUE_NUMBER}/comments" --jq '.[].body' || true
+          } > .tmp/review_feedback.txt
+
+      - name: Generate plan
+        run: |
+          set -euo pipefail
+          if [[ -f .tmp/review_feedback.txt ]]; then
+            bash scripts/codex/generate_plan.sh \
+              "${{ steps.ctx.outputs.ticket_id }}" \
+              "${{ steps.ctx.outputs.requirements_path }}" \
+              "${{ steps.ctx.outputs.ui_path }}" \
+              ".tmp/review_feedback.txt"
+          else
+            bash scripts/codex/generate_plan.sh \
+              "${{ steps.ctx.outputs.ticket_id }}" \
+              "${{ steps.ctx.outputs.requirements_path }}" \
+              "${{ steps.ctx.outputs.ui_path }}"
+          fi
+
+      - name: Create or update PR
+        id: cpr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: plan/${{ steps.ctx.outputs.ticket_id }}
+          commit-message: "chore(plan): update plan for ${{ steps.ctx.outputs.ticket_id }}"
+          title: "plan: ${{ steps.ctx.outputs.ticket_id }}"
+          body: |
+            Auto-generated plan update.
+
+            Continue iteration by commenting:
+            - `/codex-plan ${{ steps.ctx.outputs.ticket_id }}`
+          labels: plan-review
+          add-paths: |
+            plans/${{ steps.ctx.outputs.ticket_id }}/plan.md
+            plans/${{ steps.ctx.outputs.ticket_id }}/plan_history
